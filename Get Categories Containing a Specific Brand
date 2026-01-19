@@ -1,0 +1,33 @@
+function get_categories_with_brand( $brand_slug ) {
+    // Get all products with the given brand
+    $args = array(
+        'post_type'      => 'product',
+        'posts_per_page' => -1,
+        'tax_query'      => array(
+            array(
+                'taxonomy' => 'product_brand', // Adjust if your brand taxonomy is named differently
+                'field'    => 'slug',
+                'terms'    => $brand_slug,
+            ),
+        ),
+        'fields' => 'ids',
+    );
+    $product_ids = get_posts( $args );
+
+    // Get all categories for these products
+    $category_ids = array();
+    foreach ( $product_ids as $product_id ) {
+        $terms = wp_get_post_terms( $product_id, 'product_cat', array( 'fields' => 'ids' ) );
+        $category_ids = array_merge( $category_ids, $terms );
+    }
+    $category_ids = array_unique( $category_ids );
+
+    // Get category objects
+    $categories = get_terms( array(
+        'taxonomy'   => 'product_cat',
+        'include'    => $category_ids,
+        'hide_empty' => false,
+    ) );
+
+    return $categories;
+}
