@@ -1,0 +1,30 @@
+// Add COD fee
+add_action( 'woocommerce_cart_calculate_fees', 'add_cod_fee' );
+
+function add_cod_fee( $cart ) {
+    if ( is_admin() && ! defined( 'DOING_AJAX' ) ) {
+        return;
+    }
+
+    $chosen_payment_method = WC()->session->get( 'chosen_payment_method' );
+
+    if ( 'cod' !== $chosen_payment_method ) {
+        return;
+    }
+
+    $fee_amount = 1;
+    $fee_label  = __( 'Такса "Наложен платеж"', 'woocommerce' );
+
+    $cart->add_fee( $fee_label, $fee_amount, false );
+}
+
+// Refresh checkout on payment method change
+add_action( 'woocommerce_checkout_init', 'cod_fee_refresh_checkout' );
+
+function cod_fee_refresh_checkout() {
+    wc_enqueue_js( "
+        jQuery( document.body ).on( 'change', 'input[name=payment_method]', function() {
+            jQuery( document.body ).trigger( 'update_checkout' );
+        });
+    " );
+}
