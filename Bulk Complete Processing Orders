@@ -1,9 +1,10 @@
 <?php
 /**
  * Plugin Name: Bulk Complete Processing Orders
- * Description: Adds a Tools page to bulk mark all WooCommerce "Processing" orders as "Completed" using AJAX batch processing.
- * Version: 2.0
+ * Description: Bulk transition WooCommerce orders from "Processing" to "Completed" in batches, preserving original dates for accurate Analytics.
+ * Version: 1.2.0
  * Author: Stefan Velev
+ * Requires Plugins: woocommerce
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -12,367 +13,337 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class Bulk_Complete_Processing_Orders {
 
-    /**
-     * Default batch size
-     */
-    const DEFAULT_BATCH_SIZE = 25;
-
     public function __construct() {
-        add_action( 'admin_menu', array( $this, 'add_tools_page' ) );
-        add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_scripts' ) );
-        add_action( 'wp_ajax_bulk_complete_batch', array( $this, 'ajax_process_batch' ) );
+        add_action( 'admin_menu', [ $this, 'add_tools_page' ] );
+        add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_scripts' ] );
+
+        // AJAX handlers
+        add_action( 'wp_ajax_bco_count_orders', [ $this, 'ajax_count_orders' ] );
+        add_action( 'wp_ajax_bco_process_batch', [ $this, 'ajax_process_batch' ] );
+        add_action( 'wp_ajax_bco_fix_dates_count', [ $this, 'ajax_fix_dates_count' ] );
+        add_action( 'wp_ajax_bco_fix_dates_batch', [ $this, 'ajax_fix_dates_batch' ] );
     }
 
-    /**
-     * Add submenu page under Tools
-     */
+    /* ───────────────────────────────
+     *  ADMIN MENU
+     * ─────────────────────────────── */
     public function add_tools_page() {
         add_management_page(
             'Bulk Complete Orders',
             'Bulk Complete Orders',
             'manage_woocommerce',
             'bulk-complete-orders',
-            array( $this, 'render_settings_page' )
+            [ $this, 'render_tools_page' ]
         );
     }
 
-    /**
-     * Enqueue scripts only on our tools page
-     */
-    public function enqueue_scripts( $hook ) {
-        if ( $hook !== 'tools_page_bulk-complete-orders' ) {
-            return;
-        }
-
-        wp_enqueue_script(
-            'bulk-complete-orders-js',
-            '', // We'll use inline script
-            array( 'jquery' ),
-            '2.0',
-            true
-        );
-
-        // Pass AJAX data to the page via inline script
-        wp_localize_script( 'jquery', 'bulkCompleteOrders', array(
-            'ajax_url' => admin_url( 'admin-ajax.php' ),
-            'nonce'    => wp_create_nonce( 'bulk_complete_orders_nonce' ),
-        ) );
-    }
-
-    /**
-     * Get count of processing orders
-     */
-    private function get_processing_count() {
-        $orders = wc_get_orders( array(
-            'status' => 'processing',
-            'limit'  => -1,
-            'return' => 'ids',
-        ) );
-        return count( $orders );
-    }
-
-    /**
-     * Render the settings/tools page
-     */
-    public function render_settings_page() {
-        $count = $this->get_processing_count();
+    /* ───────────────────────────────
+     *  ADMIN PAGE HTML
+     * ─────────────────────────────── */
+    public function render_tools_page() {
         ?>
         <div class="wrap">
             <h1>Bulk Complete Processing Orders</h1>
 
-            <div class="card" style="max-width: 650px; padding: 20px;">
-                <h2>Mark All Processing Orders as Completed</h2>
-                <p>
-                    This tool will change the status of <strong>all</strong> orders currently
-                    set to <em>"Processing"</em> to <em>"Completed"</em>.
-                    Orders are processed in <strong>batches</strong> to prevent server timeouts.
-                </p>
+            <!-- ── Section 1: Bulk Complete ── -->
+            <div class="card" style="max-width:720px;margin-top:20px;padding:20px;">
+                <h2>1 — Mark Processing → Completed</h2>
+                <p>This will change <strong>Processing</strong> orders to <strong>Completed</strong> in batches.
+                   The <code>date_completed</code> will be set to each order's <strong>date_paid</strong>
+                   (or <strong>date_created</strong> if unpaid) so Analytics stay accurate.</p>
 
-                <table class="form-table" style="margin: 0;">
+                <table class="form-table">
                     <tr>
-                        <th scope="row">Processing Orders</th>
+                        <th><label for="bco_batch_size">Batch Size</label></th>
                         <td>
-                            <span id="bco-total-count" style="font-size: 1.4em; font-weight: bold; color: #0073aa;">
-                                <?php echo esc_html( $count ); ?>
-                            </span>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row"><label for="bco-batch-size">Batch Size</label></th>
-                        <td>
-                            <select id="bco-batch-size">
-                                <option value="10">10 orders per batch</option>
-                                <option value="25" selected>25 orders per batch (recommended)</option>
-                                <option value="50">50 orders per batch</option>
-                                <option value="75">75 orders per batch</option>
-                                <option value="100">100 orders per batch</option>
-                            </select>
-                            <p class="description">
-                                Lower batch sizes are safer for shared hosting. Increase if your server can handle it.
-                            </p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row">Suppress Emails</th>
-                        <td>
-                            <label>
-                                <input type="checkbox" id="bco-suppress-emails" value="1" checked />
-                                Prevent WooCommerce from sending "Order Completed" emails during bulk update
-                            </label>
+                            <input type="number" id="bco_batch_size" value="25" min="1" max="200" style="width:80px;">
+                            <p class="description">Orders per request. Lower = safer for shared hosting.</p>
                         </td>
                     </tr>
                 </table>
 
-                <?php if ( $count > 0 ) : ?>
-                    <div style="margin-top: 15px;">
-                        <label>
-                            <input type="checkbox" id="bco-confirm" value="1" />
-                            I confirm I want to mark all <strong><?php echo esc_html( $count ); ?></strong>
-                            processing order(s) as completed.
-                        </label>
-                    </div>
-
-                    <p style="margin-top: 15px;">
-                        <button type="button" id="bco-start-btn" class="button button-primary" disabled>
-                            🚀 Start Batch Processing
-                        </button>
-                        <button type="button" id="bco-stop-btn" class="button button-secondary" style="display:none;">
-                            ⏹ Stop
-                        </button>
-                    </p>
-                <?php else : ?>
-                    <p style="color: green; margin-top: 15px;">
-                        <strong>✅ No orders in "Processing" status. Nothing to do!</strong>
-                    </p>
-                <?php endif; ?>
-
-                <!-- Progress Section -->
-                <div id="bco-progress-section" style="display: none; margin-top: 20px;">
-                    <h3>Progress</h3>
-                    <div style="background: #e0e0e0; border-radius: 4px; overflow: hidden; height: 30px; position: relative;">
-                        <div id="bco-progress-bar" style="background: #0073aa; height: 100%; width: 0%; transition: width 0.3s ease; border-radius: 4px;"></div>
-                        <span id="bco-progress-text" style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-weight: bold; color: #333;">
-                            0%
-                        </span>
-                    </div>
-                    <p id="bco-progress-details" style="margin-top: 8px; color: #555;">
-                        Waiting to start...
-                    </p>
+                <p>
+                    <button id="bco-start" class="button button-primary">Start Bulk Complete</button>
+                    <button id="bco-stop" class="button" style="display:none;">Stop</button>
+                </p>
+                <div id="bco-progress" style="display:none;">
+                    <progress id="bco-bar" value="0" max="100" style="width:100%;height:28px;"></progress>
+                    <p id="bco-status"></p>
                 </div>
+                <div id="bco-log" style="max-height:200px;overflow-y:auto;background:#f6f6f6;padding:10px;margin-top:10px;display:none;font-family:monospace;font-size:12px;"></div>
+            </div>
 
-                <!-- Log Section -->
-                <div id="bco-log-section" style="display: none; margin-top: 15px;">
-                    <h3>Log</h3>
-                    <div id="bco-log" style="background: #1d2327; color: #00ff41; padding: 12px; border-radius: 4px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px;">
-                    </div>
-                </div>
+            <!-- ── Section 2: Fix Dates ── -->
+            <div class="card" style="max-width:720px;margin-top:20px;padding:20px;">
+                <h2>2 — Fix Completed Dates (Repair Analytics)</h2>
+                <p>If you already bulk-completed orders <em>without</em> preserving dates, this tool
+                   will reset each order's <code>date_completed</code> back to its
+                   <strong>date_paid</strong> (or <strong>date_created</strong>).</p>
 
-                <!-- Completion Section -->
-                <div id="bco-complete-section" style="display: none; margin-top: 15px;">
-                    <div class="notice notice-success inline" style="margin: 0;">
-                        <p id="bco-complete-message"></p>
-                    </div>
+                <table class="form-table">
+                    <tr>
+                        <th><label for="bco_fix_date">Fix orders completed on</label></th>
+                        <td>
+                            <input type="date" id="bco_fix_date" value="<?php echo esc_attr( date( 'Y-m-d' ) ); ?>">
+                            <p class="description">Only orders whose <code>date_completed</code> matches this date will be fixed.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><label for="bco_fix_batch">Batch Size</label></th>
+                        <td>
+                            <input type="number" id="bco_fix_batch" value="25" min="1" max="200" style="width:80px;">
+                        </td>
+                    </tr>
+                </table>
+
+                <p>
+                    <button id="bco-fix-start" class="button button-primary">Start Date Fix</button>
+                    <button id="bco-fix-stop" class="button" style="display:none;">Stop</button>
+                </p>
+                <div id="bco-fix-progress" style="display:none;">
+                    <progress id="bco-fix-bar" value="0" max="100" style="width:100%;height:28px;"></progress>
+                    <p id="bco-fix-status"></p>
                 </div>
+                <div id="bco-fix-log" style="max-height:200px;overflow-y:auto;background:#f6f6f6;padding:10px;margin-top:10px;display:none;font-family:monospace;font-size:12px;"></div>
             </div>
         </div>
-
-        <script type="text/javascript">
-        jQuery(document).ready(function($) {
-
-            var isRunning = false;
-            var totalProcessed = 0;
-            var totalOrders = parseInt( $('#bco-total-count').text(), 10 );
-            var stopRequested = false;
-
-            // Enable/disable start button based on confirmation checkbox
-            $('#bco-confirm').on('change', function() {
-                $('#bco-start-btn').prop('disabled', !$(this).is(':checked'));
-            });
-
-            // Start processing
-            $('#bco-start-btn').on('click', function() {
-                if ( isRunning ) return;
-                if ( !confirm('Are you sure you want to mark all processing orders as completed?') ) return;
-
-                isRunning = true;
-                stopRequested = false;
-                totalProcessed = 0;
-
-                $('#bco-start-btn').prop('disabled', true).text('⏳ Processing...');
-                $('#bco-stop-btn').show();
-                $('#bco-confirm').prop('disabled', true);
-                $('#bco-batch-size').prop('disabled', true);
-                $('#bco-suppress-emails').prop('disabled', true);
-                $('#bco-progress-section').slideDown();
-                $('#bco-log-section').slideDown();
-                $('#bco-complete-section').hide();
-                $('#bco-log').empty();
-
-                addLog('🟢 Batch processing started...');
-                processBatch();
-            });
-
-            // Stop processing
-            $('#bco-stop-btn').on('click', function() {
-                stopRequested = true;
-                addLog('🟡 Stop requested. Finishing current batch...');
-                $(this).prop('disabled', true).text('⏳ Stopping...');
-            });
-
-            function processBatch() {
-                if ( stopRequested ) {
-                    finishProcessing('stopped');
-                    return;
-                }
-
-                var batchSize = parseInt( $('#bco-batch-size').val(), 10 );
-                var suppressEmails = $('#bco-suppress-emails').is(':checked') ? 1 : 0;
-
-                $.ajax({
-                    url: bulkCompleteOrders.ajax_url,
-                    type: 'POST',
-                    data: {
-                        action: 'bulk_complete_batch',
-                        nonce: bulkCompleteOrders.nonce,
-                        batch_size: batchSize,
-                        suppress_emails: suppressEmails
-                    },
-                    success: function(response) {
-                        if ( response.success ) {
-                            var data = response.data;
-                            totalProcessed += data.processed;
-
-                            // Update progress
-                            var percent = totalOrders > 0 ? Math.min( Math.round( (totalProcessed / totalOrders) * 100 ), 100 ) : 100;
-                            $('#bco-progress-bar').css('width', percent + '%');
-                            $('#bco-progress-text').text( percent + '%' );
-                            $('#bco-progress-details').text(
-                                'Processed ' + totalProcessed + ' of ' + totalOrders + ' orders | Remaining: ' + data.remaining
-                            );
-
-                            addLog('✅ Batch done: ' + data.processed + ' orders completed. Remaining: ' + data.remaining);
-
-                            if ( data.remaining > 0 && !stopRequested ) {
-                                // Small delay to let the server breathe
-                                setTimeout( processBatch, 1000 );
-                            } else {
-                                finishProcessing('complete');
-                            }
-                        } else {
-                            addLog('❌ Error: ' + (response.data || 'Unknown error'));
-                            finishProcessing('error');
-                        }
-                    },
-                    error: function(xhr, status, error) {
-                        addLog('❌ AJAX Error: ' + error + ' (Status: ' + xhr.status + ')');
-                        addLog('💡 Try reducing the batch size and click Start again.');
-                        finishProcessing('error');
-                    }
-                });
-            }
-
-            function finishProcessing( status ) {
-                isRunning = false;
-                $('#bco-stop-btn').hide().prop('disabled', false).text('⏹ Stop');
-                $('#bco-confirm').prop('disabled', false);
-                $('#bco-batch-size').prop('disabled', false);
-                $('#bco-suppress-emails').prop('disabled', false);
-
-                if ( status === 'complete' ) {
-                    $('#bco-progress-bar').css('width', '100%').css('background', '#00a32a');
-                    $('#bco-progress-text').text('100%');
-                    $('#bco-start-btn').text('✅ Done!').prop('disabled', true);
-                    $('#bco-complete-section').show();
-                    $('#bco-complete-message').html(
-                        '🎉 <strong>' + totalProcessed + '</strong> order(s) have been marked as "Completed" successfully!'
-                    );
-                    addLog('🏁 All done! ' + totalProcessed + ' orders completed.');
-                    // Update counter
-                    $('#bco-total-count').text('0');
-                } else if ( status === 'stopped' ) {
-                    $('#bco-progress-bar').css('background', '#dba617');
-                    $('#bco-start-btn').text('🚀 Resume Processing').prop('disabled', false);
-                    addLog('⏹ Stopped. ' + totalProcessed + ' orders were completed before stopping.');
-                    // Update counter
-                    var newRemaining = totalOrders - totalProcessed;
-                    $('#bco-total-count').text( newRemaining > 0 ? newRemaining : 0 );
-                    totalOrders = newRemaining > 0 ? newRemaining : 0;
-                } else {
-                    $('#bco-progress-bar').css('background', '#d63638');
-                    $('#bco-start-btn').text('🔄 Retry').prop('disabled', false);
-                    addLog('⚠️ Processing stopped due to an error. You can retry with a smaller batch size.');
-                }
-            }
-
-            function addLog( message ) {
-                var time = new Date().toLocaleTimeString();
-                $('#bco-log').append('[' + time + '] ' + message + '\n');
-                $('#bco-log').scrollTop( $('#bco-log')[0].scrollHeight );
-            }
-        });
-        </script>
         <?php
     }
 
-    /**
-     * AJAX handler: Process a single batch of orders
-     */
-    public function ajax_process_batch() {
-        // Verify nonce
-        if ( ! check_ajax_referer( 'bulk_complete_orders_nonce', 'nonce', false ) ) {
-            wp_send_json_error( 'Security check failed.' );
+    /* ───────────────────────────────
+     *  ENQUEUE JS (inline for simplicity)
+     * ─────────────────────────────── */
+    public function enqueue_scripts( $hook ) {
+        if ( $hook !== 'tools_page_bulk-complete-orders' ) {
+            return;
         }
+        wp_enqueue_script( 'jquery' );
+        wp_add_inline_script( 'jquery', $this->get_inline_js() );
+        wp_localize_script( 'jquery', 'bco', [
+            'ajax_url' => admin_url( 'admin-ajax.php' ),
+            'nonce'    => wp_create_nonce( 'bco_nonce' ),
+        ] );
+    }
 
-        // Check capability
-        if ( ! current_user_can( 'manage_woocommerce' ) ) {
-            wp_send_json_error( 'Unauthorized.' );
-        }
+    private function get_inline_js() {
+        ob_start(); ?>
+        (function($){
+            /* ── Bulk Complete ── */
+            let running = false, stopped = false, processed = 0, total = 0;
 
-        $batch_size      = isset( $_POST['batch_size'] ) ? absint( $_POST['batch_size'] ) : self::DEFAULT_BATCH_SIZE;
-        $suppress_emails = isset( $_POST['suppress_emails'] ) && $_POST['suppress_emails'] == '1';
+            $('#bco-start').on('click', function(){
+                if(running) return;
+                running = true; stopped = false; processed = 0;
+                $(this).hide(); $('#bco-stop').show();
+                $('#bco-progress,#bco-log').show();
+                $('#bco-log').html('');
+                log('Counting processing orders…');
 
-        // Clamp batch size between 5 and 100
-        $batch_size = max( 5, min( 100, $batch_size ) );
+                $.post(bco.ajax_url,{action:'bco_count_orders',nonce:bco.nonce},function(r){
+                    if(!r.success){log('Error: '+r.data);finish();return;}
+                    total = r.data.count;
+                    log('Found '+total+' processing orders.');
+                    if(total===0){finish();return;}
+                    nextBatch();
+                });
+            });
 
-        // Suppress WooCommerce completed order emails if requested
-        if ( $suppress_emails ) {
-            add_filter( 'woocommerce_email_enabled_customer_completed_order', '__return_false' );
-            add_filter( 'woocommerce_email_enabled_customer_completed_renewal_order', '__return_false' );
-        }
+            $('#bco-stop').on('click',function(){ stopped=true; log('Stopping after current batch…'); });
 
-        // Fetch only a limited batch of processing orders
-        $processing_orders = wc_get_orders( array(
-            'status' => 'processing',
-            'limit'  => $batch_size,
-            'orderby' => 'date',
-            'order'   => 'ASC',
-        ) );
+            function nextBatch(){
+                if(stopped){finish();return;}
+                let bs = parseInt($('#bco_batch_size').val())||25;
+                $.post(bco.ajax_url,{action:'bco_process_batch',nonce:bco.nonce,batch_size:bs},function(r){
+                    if(!r.success){log('Error: '+r.data);finish();return;}
+                    processed += r.data.processed;
+                    let pct = total ? Math.round(processed/total*100) : 100;
+                    $('#bco-bar').val(pct);
+                    $('#bco-status').text(processed+' / '+total+' ('+pct+'%)');
+                    log('Batch done — '+r.data.processed+' orders completed.');
+                    if(r.data.remaining > 0 && !stopped){ nextBatch(); }
+                    else{ log('✅ All done! '+processed+' orders completed.'); finish(); }
+                }).fail(function(x){ log('Server error ('+x.status+'). Try a smaller batch size.'); finish(); });
+            }
 
-        $processed = 0;
+            function finish(){ running=false; $('#bco-start').show(); $('#bco-stop').hide(); }
+            function log(m){ $('#bco-log').append('<div>['+new Date().toLocaleTimeString()+'] '+m+'</div>').scrollTop(9999); }
 
-        foreach ( $processing_orders as $order ) {
-            $order->update_status( 'completed', 'Bulk status update via Bulk Complete Orders tool.' );
-            $processed++;
-        }
+            /* ── Fix Dates ── */
+            let fRunning=false, fStopped=false, fProcessed=0, fTotal=0;
 
-        // Get remaining count
-        $remaining_orders = wc_get_orders( array(
+            $('#bco-fix-start').on('click',function(){
+                if(fRunning) return;
+                fRunning=true; fStopped=false; fProcessed=0;
+                $(this).hide(); $('#bco-fix-stop').show();
+                $('#bco-fix-progress,#bco-fix-log').show();
+                $('#bco-fix-log').html('');
+                fLog('Counting orders to fix…');
+
+                $.post(bco.ajax_url,{action:'bco_fix_dates_count',nonce:bco.nonce,fix_date:$('#bco_fix_date').val()},function(r){
+                    if(!r.success){fLog('Error: '+r.data);fFinish();return;}
+                    fTotal=r.data.count;
+                    fLog('Found '+fTotal+' orders to fix.');
+                    if(fTotal===0){fFinish();return;}
+                    fNextBatch();
+                });
+            });
+
+            $('#bco-fix-stop').on('click',function(){ fStopped=true; fLog('Stopping…'); });
+
+            function fNextBatch(){
+                if(fStopped){fFinish();return;}
+                let bs=parseInt($('#bco_fix_batch').val())||25;
+                $.post(bco.ajax_url,{action:'bco_fix_dates_batch',nonce:bco.nonce,batch_size:bs,fix_date:$('#bco_fix_date').val()},function(r){
+                    if(!r.success){fLog('Error: '+r.data);fFinish();return;}
+                    fProcessed+=r.data.fixed;
+                    let pct=fTotal?Math.round(fProcessed/fTotal*100):100;
+                    $('#bco-fix-bar').val(pct);
+                    $('#bco-fix-status').text(fProcessed+' / '+fTotal+' ('+pct+'%)');
+                    fLog('Batch done — '+r.data.fixed+' dates fixed.');
+                    if(r.data.remaining>0 && !fStopped){ fNextBatch(); }
+                    else{ fLog('✅ All done! '+fProcessed+' order dates restored.'); fFinish(); }
+                }).fail(function(x){ fLog('Server error ('+x.status+'). Try a smaller batch.'); fFinish(); });
+            }
+
+            function fFinish(){ fRunning=false; $('#bco-fix-start').show(); $('#bco-fix-stop').hide(); }
+            function fLog(m){ $('#bco-fix-log').append('<div>['+new Date().toLocaleTimeString()+'] '+m+'</div>').scrollTop(9999); }
+        })(jQuery);
+        <?php
+        return ob_get_clean();
+    }
+
+    /* ───────────────────────────────
+     *  AJAX — COUNT PROCESSING ORDERS
+     * ─────────────────────────────── */
+    public function ajax_count_orders() {
+        $this->verify();
+        $orders = wc_get_orders( [
             'status' => 'processing',
             'limit'  => -1,
             'return' => 'ids',
-        ) );
-        $remaining = count( $remaining_orders );
+        ] );
+        wp_send_json_success( [ 'count' => count( $orders ) ] );
+    }
 
-        wp_send_json_success( array(
-            'processed' => $processed,
-            'remaining' => $remaining,
-        ) );
+    /* ───────────────────────────────
+     *  AJAX — PROCESS A BATCH (with date preservation)
+     * ─────────────────────────────── */
+    public function ajax_process_batch() {
+        $this->verify();
+        $batch_size = absint( $_POST['batch_size'] ?? 25 );
+        $batch_size = min( max( $batch_size, 1 ), 200 );
+
+        $order_ids = wc_get_orders( [
+            'status' => 'processing',
+            'limit'  => $batch_size,
+            'return' => 'ids',
+        ] );
+
+        $done = 0;
+        foreach ( $order_ids as $order_id ) {
+            $order = wc_get_order( $order_id );
+            if ( ! $order ) continue;
+
+            // Determine the correct completed date (date_paid → date_created)
+            $original_date = $order->get_date_paid() ?? $order->get_date_created();
+
+            // Remove the default "set date_completed to now()" behaviour
+            remove_all_actions( 'woocommerce_order_status_completed' );
+
+            $order->set_status( 'completed' );
+
+            // Override date_completed with the original date
+            if ( $original_date ) {
+                $order->set_date_completed( $original_date->getTimestamp() );
+            }
+
+            $order->save();
+            $done++;
+        }
+
+        // Count remaining
+        $remaining = wc_get_orders( [
+            'status' => 'processing',
+            'limit'  => 1,
+            'return' => 'ids',
+        ] );
+
+        wp_send_json_success( [
+            'processed' => $done,
+            'remaining' => count( $remaining ),
+        ] );
+    }
+
+    /* ───────────────────────────────
+     *  AJAX — COUNT ORDERS TO FIX
+     * ─────────────────────────────── */
+    public function ajax_fix_dates_count() {
+        $this->verify();
+        $ids = $this->get_wrongly_dated_order_ids( $_POST['fix_date'] ?? '', -1 );
+        wp_send_json_success( [ 'count' => count( $ids ) ] );
+    }
+
+    /* ───────────────────────────────
+     *  AJAX — FIX DATES BATCH
+     * ─────────────────────────────── */
+    public function ajax_fix_dates_batch() {
+        $this->verify();
+        $batch_size = min( max( absint( $_POST['batch_size'] ?? 25 ), 1 ), 200 );
+        $fix_date   = sanitize_text_field( $_POST['fix_date'] ?? '' );
+
+        $order_ids = $this->get_wrongly_dated_order_ids( $fix_date, $batch_size );
+
+        $fixed = 0;
+        foreach ( $order_ids as $order_id ) {
+            $order = wc_get_order( $order_id );
+            if ( ! $order ) continue;
+
+            $original_date = $order->get_date_paid() ?? $order->get_date_created();
+            if ( $original_date ) {
+                $order->set_date_completed( $original_date->getTimestamp() );
+                $order->save();
+                $fixed++;
+            }
+        }
+
+        $remaining = $this->get_wrongly_dated_order_ids( $fix_date, 1 );
+
+        wp_send_json_success( [
+            'fixed'     => $fixed,
+            'remaining' => count( $remaining ),
+        ] );
+    }
+
+    /* ───────────────────────────────
+     *  HELPERS
+     * ─────────────────────────────── */
+
+    /**
+     * Get completed order IDs whose date_completed falls on a specific date.
+     */
+    private function get_wrongly_dated_order_ids( $date_string, $limit = -1 ) {
+        $date_string = sanitize_text_field( $date_string );
+        if ( ! $date_string ) {
+            $date_string = date( 'Y-m-d' );
+        }
+
+        $start = $date_string . 'T00:00:00';
+        $end   = $date_string . 'T23:59:59';
+
+        return wc_get_orders( [
+            'status'         => 'completed',
+            'limit'          => $limit,
+            'return'         => 'ids',
+            'date_completed' => $start . '...' . $end,
+        ] );
+    }
+
+    private function verify() {
+        check_ajax_referer( 'bco_nonce', 'nonce' );
+        if ( ! current_user_can( 'manage_woocommerce' ) ) {
+            wp_send_json_error( 'Unauthorized' );
+        }
     }
 }
 
-// Initialize only if WooCommerce is active
-add_action( 'plugins_loaded', function() {
-    if ( class_exists( 'WooCommerce' ) ) {
-        new Bulk_Complete_Processing_Orders();
-    }
-} );
+new Bulk_Complete_Processing_Orders();
